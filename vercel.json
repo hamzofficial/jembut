@@ -1,0 +1,19 @@
+{
+  "functions": {
+    "app/api/bot/poll/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/bot/webhook/route.ts": {
+      "maxDuration": 30
+    },
+    "app/api/auth/send-code/route.ts": {
+      "maxDuration": 30
+    },
+    "app/api/auth/verify-code/route.ts": {
+      "maxDuration": 30
+    },
+    "app/api/auth/verify-password/route.ts": {
+      "maxDuration": 30
+    }
+  }
+}
